@@ -1,0 +1,887 @@
+#!/usr/bin/env perl
+# -*- mode: cperl; eval: (follow-mode) -*-
+
+use strict;
+use warnings;
+use diagnostics;
+
+use Carp;
+use File::Basename;
+use File::Copy;
+
+use Data::Printer caller_info => 1, print_escapes => 1,
+  output => 'stdout', class => { expand => 2 },
+  caller_message => "DEBUG __FILENAME__:__LINE__ ";
+
+use Getopt::Long  qw(:config no_ignore_case gnu_getopt auto_help auto_version);
+use Pod::Man;
+use Pod::Usage    qw(pod2usage);
+use REST::Client;
+use JSON;
+use DBI;
+use POSIX qw(strftime);
+
+my  @PROGARG  = ($0, @ARGV);
+our $VERSION  = '1.18';
+my $tfc_creds =
+  { token        => '',
+    workspace_id => { qa    => '',
+		      dev   => '',
+		      stage => '',
+		      prod  => '' }
+  };
+
+my %o;
+$o{_progname} = fileparse($0);
+$o{ts}        = strftime "%F_%T", localtime;
+$o{debug}     = 0;
+
+GetOptions (
+	    'b|backup'          => \$o{backup},
+	    'cmp-direction=s'   => \$o{cmp_dir},
+	    'cmp-db-file=s'     => \$o{cmp_db},
+	    'c|cmp-env=s'       => \$o{cmp_env},
+	    'cmp-env-value'     => \$o{cmp_env_value},
+	    'e|env=s'           => \$o{env},
+	    'D|debug+'          => \$o{debug},
+	    'd|database-file=s' => \$o{db},
+	    'n|dry-run'         => \$o{dry_run},
+	    'get-org'           => \$o{get_org},
+	    'get-ws'            => \$o{get_ws},
+	    'j|json-file=s'     => \$o{json_file},
+	    'org=s'             => \$o{org},
+	    'p|pull'            => \$o{pull},
+	    'P|push'            => \$o{push},
+	    'i|import'          => \$o{import},
+	    'v|variable=s%'     => \$o{var},
+	    'h|help'            => sub { pod2usage(-exitval => 0,
+						   -verbose => 2);
+					 exit 0 },
+	    'V|version'         => sub { print "$o{_progname}, version $VERSION\n";
+					 exit 0 }
+	    );
+
+my $json = JSON->new->allow_nonref;
+my $tfrc_json;
+if ( -e -r "$ENV{'HOME'}/.terraform.d/credentials.tfrc.json" ) {
+  open(my $fh, "<", "$ENV{'HOME'}/.terraform.d/credentials.tfrc.json") ||
+    die "Can't open < $ENV{'HOME'}/.terraform.d/credentials.tfrc.json: $!";
+  {
+    local $/;
+    $tfrc_json = <$fh>;
+  }
+  close($fh) || warn "close failed: $!";
+  $tfc_creds->{token} = $json->decode( $tfrc_json )->{credentials}->{'app.terraform.io'}->{token};
+  p $tfc_creds->{token} if $o{debug} > 0;
+} elsif ( exists $ENV{'TFCVIMEX_TOKEN'} && length($ENV{'TFCVIMEX_TOKEN'}) > 0 ) {
+  $tfc_creds->{token} = $ENV{'TFCVIMEX_TOKEN'}
+}
+
+foreach my $en (sort (keys %ENV)) {
+  next if $en !~ /TFCVIMEX_WORKSPACE_ID_/;
+  $tfc_creds->{workspace_id}->{lc(substr($en, 22))} = $ENV{$en}
+    if length($ENV{$en}) > 0;
+}
+
+pod2usage(-message => "Credentials are not set. Look section CREDENTIALS of the manual.", -exitval => 2,
+	  -verbose => 2, -sections => [qw(CREDENTIALS)])
+  if $tfc_creds->{token} eq '';
+
+$o{db}  = 'tfc-variables' if ! $o{db};
+$o{env} = 'qa'            if ! $o{env};
+
+# we can backup only an existent file
+move($o{db}, "$o{db}_$o{ts}") if -B $o{db} && $o{backup};
+
+my $dbh = DBI->connect("dbi:SQLite:dbname=$o{db}", "", "",
+		       { AutoCommit => 1,
+			 RaiseError => 1, }) || croak $DBI::errstr;
+
+db_create($dbh, $o{ts});
+
+pod2usage(-exitval => 0, -verbose => 2, -msg => "\nERROR: not clear what to do\n\n")
+  if $o{json_file} && ! $o{pull} && ! $o{push} && ! $o{import} && ! $o{backup} && ! $o{var} && ! $o{cmp_dir} && ! $o{cmp_db};
+
+pod2usage(-exitval => 0, -verbose => 1, -msg => "\nERROR: -c can not be equal to -e\n\n")
+  if $o{cmp_env} && $o{cmp_env} eq $o{env};
+
+pod2usage(-exitval => 0, -verbose => 1, -msg => "\nERROR: to get workspaces, you need set organization name. Option --org or env TFCVIMEX_ORG\n\n")
+  if ( $o{get_ws} && ! exists $o{org} &&
+	(! exists $ENV{'TFCVIMEX_ORG'} ||
+	 length($ENV{'TFCVIMEX_ORG'}) < 1 ) );
+
+pod2usage(-exitval => 0, -verbose => 2, -msg => "\nERROR: action is not clear (only one option can be set: -p, -P or -j)\n\n")
+  if ($o{json_file} && $o{pull} && $o{push})    ||
+  ($o{json_file} && ($o{pull} || $o{push}))     ||
+  ($o{pull} && $o{push});
+
+  my $client = REST::Client->new();
+$client->setHost('https://app.terraform.io');
+$client->addHeader('Authorization', "Bearer $tfc_creds->{token}");
+$client->addHeader('Content-Type',  'application/vnd.api+json');
+
+my ($tfvars, $sth, $stmt, $rc, $rv, $hash_ref, @tmp_arr);
+
+$o{org} = $ENV{'TFCVIMEX_ORG'}
+  if exists $ENV{'TFCVIMEX_ORG'} && length($ENV{'TFCVIMEX_ORG'}) > 0;
+
+###################################################################
+# GET ORGANIZATIONS
+###################################################################
+if ( $o{get_org} ) {
+  my $org = tfc_getorg($client);
+  p( $org, caller_message => "ORGANIZATIONS AVAILABLE:");
+  exit 0;
+}
+
+###################################################################
+# GET WORSPACES
+###################################################################
+if ( $o{get_ws} ) {
+  my $org = tfc_getws($client, $o{org});
+  p( $org, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}):");
+  exit 0;
+}
+
+###################################################################
+# GET DATA INTO DB
+###################################################################
+if ( $o{json_file} || $o{pull} ) {
+  $tfvars = from_json_file( $o{json_file} )
+    if $o{json_file};
+  $tfvars = tfc_pull($client, $tfc_creds->{workspace_id}->{$o{env}})
+    if $o{pull};
+  $stmt = qq(INSERT OR REPLACE INTO tfc_variables VALUES (?,?,?,?,?,?,?,?,?));
+
+  $dbh->begin_work if ! $o{dry_run};
+  foreach ( @{$tfvars->{data}} ) {
+    next if ! defined $_->{attributes}->{value};
+
+    if ( ! $o{dry_run} ) {
+      $sth = $dbh->prepare($stmt);
+      $sth->execute(
+		    $_->{id},
+		    $_->{type},
+		    $_->{attributes}->{key},
+		    $_->{attributes}->{value},
+		    $_->{attributes}->{sensitive},
+		    $_->{attributes}->{category},
+		    $_->{attributes}->{hcl},
+		    $_->{attributes}->{description},
+		    $o{env}
+		   ) || croak $sth->errstr;
+    } else {
+      $hash_ref = db_is_value( $dbh,
+			       $o{env},
+			       $_->{attributes}->{key},
+			       $_->{attributes}->{value} );
+      p($hash_ref, caller_message => "DRY RUN PULL (TFC differs from SQL, SQL value to overwrite): __FILENAME__:__LINE__ ") if ! $hash_ref->{differs};
+    }
+  }
+  $dbh->commit if ! $o{dry_run};
+}
+
+#################################################################
+# COMPARE DATA IN TWO DBs
+#################################################################
+if ( $o{cmp_dir} && $o{cmp_db} ) {
+  db_cmp( $dbh,
+	  $o{db},
+	  $o{cmp_db},
+	  $o{cmp_dir},
+	  $o{env},
+	  $o{debug} );
+}
+
+#################################################################
+# COMPARE DATA FOR TWO ENVIRONMENTS IN ONE SINGLE DB.TABLE
+#################################################################
+if ( $o{cmp_env} ) {
+  db_cmp_envs( { dbh           => $dbh,
+		 env           => [ $o{env}, $o{cmp_env} ],
+		 cmp_env_value => $o{cmp_env_value},
+		 dryrun        => $o{dry_run},
+		 debug         => $o{debug} } );
+}
+
+#################################################################
+# PUSH DATA INTO TFC
+#################################################################
+if ( $o{push} ) {
+  $tfvars = tfc_pull($client, $tfc_creds->{workspace_id}->{$o{env}});
+
+  #-- sync SQL against TFC
+  foreach my $tfvar ( @{$tfvars->{data}} ) {
+    next if ! defined $tfvar->{attributes}->{value};
+
+    $o{tfc}->{$tfvar->{attributes}->{key}} = $tfvar;
+
+    $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ? AND attr_key = ?;);
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute($o{env}, $tfvar->{attributes}->{key})
+      || croak $dbh->errstr;
+    my $row = $sth->fetchrow_hashref;
+    if ( $tfvar->{attributes}->{value} && $row->{attr_value} &&
+	 $tfvar->{attributes}->{value} ne $row->{attr_value} ) {
+
+      print "VARIABLE TO UPDATE in TFC: $tfvar->{attributes}->{key}\n"
+	 if $o{debug} > 0;
+      print "+ $row->{attr_value}\n"              if $o{debug} > 2;
+      print "- $tfvar->{attributes}->{value}\n\n" if $o{debug} > 2;
+
+      $o{api}->{to_json}->{data} =
+	{
+	 id         => $row->{id},
+	 type       => $row->{type},
+	 attributes => {
+			key         => $row->{attr_key},
+			value       => $row->{attr_value},
+			description => $row->{attr_description},
+			category    => $row->{attr_category},
+			hcl         => $row->{attr_hcl},
+			sensitive   => $row->{attr_sensitive}
+		       }
+	};
+      $o{api}->{body} = $json->encode($o{api}->{to_json});
+      $o{api}->{req}  = 'PATCH';
+      $o{api}->{url}  = sprintf("/api/v2/workspaces/%s/vars/%s",
+				  $tfc_creds->{workspace_id}->{$o{env}},
+				  $tfvar->{id});
+      p $o{api} if $o{debug} > 1;
+    } elsif ($tfvar->{attributes}->{value} && ! $row->{attr_value}) {
+      print "VARIABLE TO DELETE FROM TFC: $tfvar->{attributes}->{key}\n\n"
+	 if $o{debug} > 0;
+      $o{api}->{req} = 'DELETE';
+      $o{api}->{url} = sprintf("/api/v2/workspaces/%s/vars/%s",
+				  $tfc_creds->{workspace_id}->{$o{env}},
+				  $tfvar->{id});
+      p $o{api} if $o{debug} > 1;
+    }
+
+    if ( exists $o{api} ) {
+      if ( ! $o{dry_run} ) {
+	tfc_push($client, $o{api});
+      } else {
+	p($o{api}, caller_message => "DRY RUN PUSH (SQL differs from TFC, TFC value to overwrite): __FILENAME__:__LINE__ ");
+      }
+      delete $o{api};
+    }
+  }
+
+  #-- sync TFC against SQL
+  $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ?;);
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute($o{env}) || croak $dbh->errstr;
+  $hash_ref = $sth->fetchall_hashref('attr_key');
+  my @tmp = sort keys %{$hash_ref};
+  foreach ( @tmp ) {
+    if (! exists $o{tfc}->{$_}) {
+
+      $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ? AND attr_key = ?;);
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute($o{env}, $_) || croak $dbh->errstr;
+      $hash_ref = $sth->fetchrow_hashref;
+
+      print "VARIABLE TO ADD to TFC: $_\n\n" if $o{debug} > 0;
+      $o{api}->{to_json}->{data} =
+	{
+	 type       => 'vars',
+	 attributes => {
+			key         => $_,
+			value       => $hash_ref->{attr_value},
+			description => '',
+			category    => 'terraform',
+			hcl         => is_hcl($hash_ref->{attr_value}),
+			sensitive   => 0
+		       }
+	};
+      $json = JSON->new->allow_nonref;
+      $o{api}->{body} = $json->encode($o{api}->{to_json});
+      $o{api}->{req}  = 'POST';
+      $o{api}->{url}  = sprintf("/api/v2/workspaces/%s/vars",
+				  $tfc_creds->{workspace_id}->{$o{env}});
+      p $o{api} if $o{debug} > 1;
+
+      if ( exists $o{api} ) {
+	if ( ! $o{dry_run} ) {
+	  tfc_push($client, $o{api});
+	} else {
+	  p($o{api}, caller_message => "DRY RUN PUSH (absent in TFC, will be added to TFC): __FILENAME__:__LINE__ ");
+	}
+	delete $o{api};
+      }
+    }
+  }
+}
+
+##################################################################
+# VARIABLEs
+##################################################################
+if ( $o{var} ) {
+  while (my ($k, $v) = each %{$o{var}}) {
+    if ( $v eq '-' ) {
+      undef $v;
+      print "Input value for variable $k (use Enter Ctrl-D to terminate): ";
+      @{$v} = <STDIN>;
+      chomp @{$v};
+      $v = join "\n", @{$v};
+      chomp $v;
+    }
+    $stmt = $k . " = " . $v;
+    if ( $v eq "" ) {
+      $dbh->do("DELETE FROM tfc_variables WHERE attr_key = ?",
+	       undef, $k) || croak $sth->errstr;
+      print "variable $k has been deleted from db locally\n";
+    } else {
+      $stmt = qq(INSERT OR REPLACE INTO tfc_variables
+                        VALUES (?,?,?,?,?,?,?,?,?););
+      $sth = $dbh->prepare($stmt);
+      $sth->execute('', 'vars', $k, $v, 0, 'terraform',
+		    is_hcl($v),
+		    sprintf("%s by %s", $o{ts}, $ENV{'USER'}),
+		    $o{env})
+	|| croak $sth->errstr;
+      print "\nvariable $k has been insert/replac-ed into db locally\n";
+    }
+  }
+}
+
+#################################################################
+# IMPORT INTO TFVARS
+#################################################################
+if ( $o{import} ) {
+  $stmt = qq(SELECT * FROM tfc_variables WHERE environment = "$o{env}" ORDER BY attr_key;);
+  my $rows = $dbh->selectall_arrayref($stmt, { 'Slice' => {} })
+    || croak "$dbh->errstr";
+
+  my $d;
+  foreach my $row ( @{$rows} ) {
+
+    printf("### VARIABLE ID: %s\n%s = %s\n\n",
+    	   $row->{id} ne '' ? $row->{id} : 'N/A, not synced to TFC',
+    	   $row->{attr_key},
+	   $row->{attr_hcl} == 1 ? $row->{attr_value} : '"' . $row->{attr_value} . '"'
+    	  );
+
+  }
+}
+
+# $source->commit(); ???
+# $sth->finish     || croak $sth->errstr;
+$dbh->disconnect || croak $dbh->errstr;
+
+#################################################################
+#################################################################
+#################################################################
+
+sub tfc_pull {
+  my $client       = shift;
+  my $workspace_id = shift;
+  my $json = JSON->new->allow_nonref;
+  $client->GET("/api/v2/workspaces/$workspace_id/vars");
+
+  if ( $client->responseCode() eq '200' ) {
+    return $json->decode( $client->responseContent() );
+  } else {
+    croak "REST ERROR: $client->responseContent()";
+  }
+}
+
+sub tfc_push {
+  my $client = shift;
+  my $api    = shift;
+  $client->POST($api->{url}, $api->{body})  if $api->{req} eq 'POST';
+  $client->PATCH($api->{url}, $api->{body}) if $api->{req} eq 'PATCH';
+  $client->DELETE($api->{url})              if $api->{req} eq 'DELETE';
+  if ($client->responseCode() ne '200') {
+    p $client->responseCode();
+    p $client->responseContent();
+  } else {
+    return $client->responseCode();
+  }
+}
+
+sub tfc_getws {
+  my $client = shift;
+  my $org    = shift;
+  my $json = JSON->new->allow_nonref;
+  $client->GET("/api/v2/organizations/$org/workspaces");
+
+  if ( $client->responseCode() eq '200' ) {
+    my $ws_arr = $json->decode( $client->responseContent() );
+    my $ws;
+    foreach (@{$ws_arr->{data}} ) {
+      $ws->{$_->{attributes}->{name}} =
+	{
+	 name        => $_->{attributes}->{name},
+	 created_at  => $_->{attributes}->{'created-at'},
+	 id          => $_->{id},
+	 description => $_->{attributes}->{description}
+	}
+      }
+    return $ws;
+  } else {
+    croak "REST ERROR: $client->responseContent()";
+  }
+}
+
+sub tfc_getorg {
+  my $client       = shift;
+  my $json = JSON->new->allow_nonref;
+  $client->GET("/api/v2/organizations");
+
+  if ( $client->responseCode() eq '200' ) {
+    my $org_arr = $json->decode( $client->responseContent() );
+    my $org;
+    foreach (@{$org_arr->{data}} ) {
+      $org->{$_->{attributes}->{name}} =
+	{
+	 name        => $_->{attributes}->{name},
+	 created_at  => $_->{attributes}->{'created-at'},
+	 email       => $_->{attributes}->{email},
+	 external_id => $_->{attributes}->{'external-id'}
+	}
+      }
+    return $org;
+  } else {
+    croak "REST ERROR: $client->responseContent()";
+  }
+}
+
+sub from_json_file {
+  my $json_file = shift;
+  my $json = JSON->new->allow_nonref;
+  my $json_text;
+  open(my $fh, "<", $json_file) || die "Can't open < $json_file: $!";
+  {
+    local $/;
+    $json_text = <$fh>;
+  }
+  close($fh) || warn "close failed: $!";
+  return $json->decode( $json_text );
+}
+
+sub is_hcl {
+  my $str = shift;
+  return
+    (substr($str, 0, 1) eq '{' && substr($str, -1) eq '}') ||
+    (substr($str, 0, 1) eq '[' && substr($str, -1) eq ']')
+    ? 1 : 0;
+}
+
+sub db_create {
+  my $dbh = shift;
+  my $ts  = shift;
+  $dbh->do("PRAGMA foreign_keys = OFF");
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS tfc_variables
+                   -- terraform cloud variables, created on $ts
+                   ( id               TEXT,
+                     type             TEXT DEFAULT 'vars',
+                     attr_key         TEXT NOT NULL,
+                     attr_value       TEXT,
+                     attr_sensitive   TEXT DEFAULT 0,
+                     attr_category    TEXT DEFAULT 'terraform',
+                     attr_hcl         TEXT,
+                     attr_description TEXT,
+                     environment      TEXT NOT NULL););
+  my $rv = $dbh->do($stmt);
+  croak "$DBI::errstr" if $rv < 0;
+  $stmt = qq(CREATE UNIQUE INDEX IF NOT EXISTS environment_key
+                    ON tfc_variables (environment, attr_key););
+  $rv = $dbh->do($stmt);
+  croak "$DBI::errstr" if $rv < 0;
+  return 0;
+}
+
+sub db_is_empty {
+  my $dbh  = shift;
+  my $stmt = qq(SELECT count(*) FROM tfc_variables;);
+  my $sth  = $dbh->prepare( $stmt );
+  my $rv   = $sth->execute() or croak $DBI::errstr;
+  croak "$DBI::errstr" if $rv < 0;
+  my @row = $sth->fetchrow_array();
+  return $row[0] == 0 ? 0 : 1;
+}
+
+sub db_is_value {
+  my $dbh         = shift;
+  my $environment = shift;
+  my $attr_key    = shift;
+  my $attr_value  = shift;
+
+  my $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ? AND attr_key = ?;);
+  my $sth  = $dbh->prepare( $stmt );
+  my $rv   = $sth->execute( $environment, $attr_key ) or croak $DBI::errstr;
+  croak "$DBI::errstr" if $rv < 0;
+  my $row = $sth->fetchrow_hashref;
+  return { differs => $sth->rows < 1 || $row->{attr_value} eq $attr_value ? 1 : 0,
+	   row     => $row };
+}
+
+sub db_cmp {
+  my $dbh         = shift;
+  my $db_left     = shift;
+  my $db_right    = shift;
+  my $direction   = shift;
+  my $environment = shift;
+  my $debug       = shift;
+  my ($a, $b, $stmt, $sth, $hdr);
+
+  if ( $direction eq 'left' ) {
+    $a = 'main.tfc_variables';
+    $b = 'rt.tfc_variables';
+    $hdr = "'$db_left' AND NOT IN '$db_right'";
+  } else {
+    $a = 'rt.tfc_variables';
+    $b = 'main.tfc_variables';
+    $hdr = "'$db_right' AND NOT IN '$db_left'";
+  }
+
+  if ( $debug > 2) {
+    $sth = $dbh->table_info('%', '%', '%')->fetchall_arrayref;
+    p $sth;
+  }
+
+  $dbh->do(qq{ATTACH '$db_right' AS 'rt'}) || croak $dbh->errstr;
+  if ( $debug > 2) {
+    $sth = $dbh->table_info('%', '%', '%')->fetchall_arrayref;
+    p $sth;
+  }
+
+  $stmt = qq(SELECT a.attr_key, a.attr_value, a.attr_hcl, a.attr_description
+             FROM $a AS a LEFT JOIN $b AS b
+             ON a.attr_key = b.attr_key AND a.environment = b.environment
+             WHERE b.attr_value IS NULL AND a.environment = ?);
+  p $stmt if $debug > 1;
+  $sth  = $dbh->prepare( $stmt );
+  my $rv   = $sth->execute( $environment ) || croak $DBI::errstr;
+  croak "$DBI::errstr" if $rv < 0;
+  my $rows = $sth->fetchall_hashref('attr_key');
+
+  print "\nIN ", $hdr, "\n", '=' x 70, "\n";
+  while (my ($k, $v) = each %{$rows}) {
+    p $v;
+  }
+
+}
+
+sub db_cmp_envs {
+  my $args = shift;
+
+  my %a = (
+	   dbh           => $args->{dbh},
+	   env           => $args->{env},
+	   cmp_env_value => $args->{cmp_env_value},
+	   dryrun        => $args->{dryrun},
+	   debug         => $args->{debug}
+	  );
+  my ( $stmt, $sth, $rv, $rows, @vars );
+  if ( $a{debug} > 2) {
+    $sth = $a{dbh}->table_info('%', '%', '%')->fetchall_arrayref;
+    p $sth;
+  }
+
+  $a{stmt} = sprintf('SELECT attr_key         AS name,
+                             attr_value       AS value,
+                             (CASE WHEN group_concat(environment) = "%s"
+                                   THEN "%s"
+                                   ELSE "%s"
+                              END) AS env
+                      FROM tfc_variables
+                      WHERE environment IN ("%s", "%s")
+                      GROUP BY attr_key%s HAVING count(*) < %s',
+		     $a{env}->[0],
+		     $a{env}->[1],
+		     $a{env}->[0],
+		     $a{env}->[0],
+		     $a{env}->[1],
+		     $a{cmp_env_value} ? ", attr_value" : "",
+		     2);
+  p %a if $a{debug} > 2;
+  $rows = $a{dbh}->selectall_hashref( $a{stmt}, 'name' );
+
+  while (my ($k, $v) = each %{$rows}) {
+    $a{result}->{$v->{env}}->{$v->{name}} = $v->{value};
+  }
+
+  if ( $a{debug} ) {
+    p( $a{result},
+       caller_message => "comparison for environments: " .
+       uc($a{env}->[0]) . " and " . uc($a{env}->[1]) . "\n" .
+       "variables absent for each one:\n");
+  } else {
+    foreach my $key ( keys %{$a{result}} ) {
+      @vars = sort(keys(%{$a{result}->{$key}}));
+      p( @vars,
+	 caller_message => "comparison for environments: " .
+	 uc($a{env}->[0]) . " and " . uc($a{env}->[1]) . "\n" .
+	 "variables absent in environment: `" . uc($key) . "`");
+      @vars = ();
+    }
+  }
+}
+
+__END__
+
+=head1 NAME
+
+tfcvimex - TerraForm Cloud Variables IMport EXport tool
+
+=head1 SYNOPSIS
+
+tfcvimex [-h] <-p | -P | -j | -i> REST OF OPTIONS
+
+=head1 DESCRIPTION
+
+Script to import/export terraform cloud variables
+
+Script receives data from TFC (option B<-p>) or json file (option B<-j>)
+received from TFC via REST endpoint and stores it in sqlite3 database.
+
+Db is created if not exists, all existent in db data values are
+updated in place each pull, either from TFC or json file.
+
+Further, from db it's possible to import data into local tfvars file.
+
+To add and/or update variable into TFC it's necessary to do that in db
+first and only after that to push it to TFC (export option B<-P>)
+
+Auth to TFC is done against API token which can be hardcoded or set in
+env var B<TFCVIMEX_TOKEN>. Env var overwrites hardcode.
+
+In addition it is possible to compare two databases. For that use options B<--cmp-db-file> and B<--cmp-direction>
+
+Finally, the order of all actions performed according the options
+present, is next:
+
+=over
+
+1. pull variables from TFC to SQL
+
+2. databases comparison
+
+3. variables comparison between two
+   environments in current database
+
+4. push variables from SQL to TFC
+
+5. variables management
+
+6. import variables from SQL to STDOUT
+
+=back
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-b | --backup>
+
+backup db file before any other action
+
+=item B<-e | --env>
+
+some ID to map to TFC workspace. B<-e> can be set with environmental
+variables (names are expected in uppercase) or hardcoded in the
+beginning of script (default is qa).
+
+variables B<TFCVIMEX_WORKSPACE_ID_XXX> value is a TFC workspace id,
+where XXX is the ID set with option B<-e> (in general it is human
+readable alias, like qa/dev/stage/etc )
+
+to know workspaces available, look B<--get-ws> option description.
+
+=item B<-d | --database-file>
+
+database file name (default: tfc-variables)
+
+=item B<-n | --dry-run>
+
+dry run
+
+=item B<-j | --json-file>
+
+JSON file with data got with Workspace Variables API request
+
+=item B<-p | --pull>
+
+pull data from TFC via Workspace Variables API request. Pull
+overwrites data in SQL.
+
+=item B<-P | --push>
+
+push data into TFC via Workspace Variables API request
+
+=item B<--get-org>
+
+get all available to your token organizations
+
+=item B<--get-ws>
+
+get all available to your token workspaces
+
+=item B<--org>
+
+set organization name (mandatory if option --get-ws requested)
+
+=item B<-i | --import>
+
+import data from db to stdout
+
+=item B<-v | --variable>
+
+variable with value can be provided as tuple key=value, can be
+provided multiple times
+
+if value is omited then variable is to be deleted
+
+if value is `-` character (dash) then value is read from STDIN with
+finalazing `Enter Ctrl-D`
+
+othewise variable is added or updated (if exists)
+
+by default, variables added are considered not "sensetive", if new
+variable 1st character is equal `{` or `[` and last character is equal
+`}` or `]` then the variable is considered to be HCT format data
+
+=item B<-c | --cmp-env>
+
+name of an environment. Variables names of this environment is to be
+compared with the one, set with option B<-e> (can not be the same)
+
+comparison is performed in one single table of the current db.
+
+=item B<-c | --cmp-env-values>
+
+Variables names and values, of environment set with B<-c> is to be
+compared with the ones, set with option B<-e> (can not be the same)
+
+comparison is performed in one single table of the current db.
+
+=item B<--cmp-direction>
+
+comparison direction: left or right. I<DBLEFT LEFT JOIN DBRIGHT> or
+I<DBRIGHT LEFT JOIN DBLEFT>
+
+=item B<--cmp-db-file>
+
+file name of db to be compared against the default one or provided via
+I<-d> option
+
+=item B<-D | --debug>
+
+debug level, can be set multiple times
+
+=item B<-h | --help>
+
+help
+
+=item B<-V | --version>
+
+version
+
+=back
+
+=head1 CREDENTIALS
+
+=over
+
+API access token is searched at:
+
+1. ~/.terraform.d/credentials.tfrc.json
+
+2. hardcode in the beginning of this script
+
+3. environmental variable B<TFCVIMEX_TOKEN>
+
+=back
+
+=head1 ENVIRONMENTAL VARIABLES
+
+all envs should be in uppercase.
+
+=back
+
+=head1 EXAMPLE
+
+=over
+
+B<to get TFC variables into db and print them to stdout:>
+
+tfcvimex -p -i
+
+B<to get variables from JSON file into db and print them to stdout:>
+
+tfcvimex -j get-from-tfc.json -i
+
+B<to backup current db, then to get TFC variables into db and print them
+to stdout:>
+
+tfcvimex -b -p -i
+
+B<to, locally, add variable AAA with value 111 and delete variable BBB>
+
+tfcvimex -v AAA=111 -v BBB=
+
+B<to update, locally, variable AAA with value 222>
+
+tfcvimex -v AAA=222
+
+B<to see a difference: SQL value differs from TFC value>
+
+tfcvimex --push --dry-run
+
+B<to see a difference: TFC value differs from SQL value>
+
+tfcvimex --pull --dry-run
+
+B<to see rows in tfc-variables and not in tfc-variables-backup>
+
+tfcvimex --cmp-direction left --cmp-db-file tfc-variables-backup
+
+B<to see rows in tfc-variables-backup and not in tfc-variables>
+
+tfcvimex --cmp-direction right --cmp-db-file tfc-variables-backup
+
+B<to see rows in tfc-variables-newbackup and not in tfc-variables-veryold-backup>
+
+tfcvimex --cmp-direction left
+         --cmp-db-file   tfc-variables-veryold-backup
+         --database-file tfc-variables-newbackup
+
+B<to see, which environment lacks which variavle/s (without values)>
+
+tfcvimex --env stage --cmp-env qa
+
+B<to see, which environment lacks which variavle/s (with values)>
+
+tfcvimex --env stage --cmp-env qa -D
+
+=back
+
+=head1 SEE ALSO
+
+L<https://www.terraform.io/docs/cloud/api/workspace-variables.html>
+
+=head1 AUTHOR
+
+Zeus Panchenko <zeus@gnu.org.ua>
+
+=head1 COPYRIGHT
+
+Copyright 2020 Zeus Panchenko.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 3, or (at your option)
+any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
