@@ -22,7 +22,7 @@ use DBI;
 use POSIX qw(strftime);
 
 my  @PROGARG  = ($0, @ARGV);
-our $VERSION  = '1.18';
+our $VERSION  = '1.19';
 my $tfc_creds =
   { token        => '',
     workspace_id => { qa    => '',
@@ -77,15 +77,20 @@ if ( -e -r "$ENV{'HOME'}/.terraform.d/credentials.tfrc.json" ) {
   $tfc_creds->{token} = $ENV{'TFCVIMEX_TOKEN'}
 }
 
+pod2usage(-message => "Credential token not set. Look section CREDENTIALS of the manual.", -exitval => 2,
+	  -verbose => 99, -sections => [qw(CREDENTIALS)])
+  if $tfc_creds->{token} eq '';
+
 foreach my $en (sort (keys %ENV)) {
   next if $en !~ /TFCVIMEX_WORKSPACE_ID_/;
   $tfc_creds->{workspace_id}->{lc(substr($en, 22))} = $ENV{$en}
     if length($ENV{$en}) > 0;
 }
 
-pod2usage(-message => "Credentials are not set. Look section CREDENTIALS of the manual.", -exitval => 2,
-	  -verbose => 2, -sections => [qw(CREDENTIALS)])
-  if $tfc_creds->{token} eq '';
+pod2usage(-message => "\nCredential workspace/s are not set. Look option B<-e> description.\n", -exitval => 2, -verbose => 0)
+  if length( join( "", values( %{$tfc_creds->{workspace_id}} ) ) ) < 1;
+
+p $tfc_creds; exit 1;
 
 $o{db}  = 'tfc-variables' if ! $o{db};
 $o{env} = 'qa'            if ! $o{env};
@@ -629,7 +634,7 @@ tfcvimex - TerraForm Cloud Variables IMport EXport tool
 
 =head1 SYNOPSIS
 
-tfcvimex [-h] <-p | -P | -j | -i> REST OF OPTIONS
+tfcvimex [-h] <-e WSNAME> <-p | -P> <-j | -i> REST OF OPTIONS
 
 =head1 DESCRIPTION
 
@@ -800,7 +805,6 @@ API access token is searched at:
 
 all envs should be in uppercase.
 
-=back
 
 =head1 EXAMPLE
 
