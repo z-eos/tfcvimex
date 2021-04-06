@@ -22,7 +22,7 @@ use DBI;
 use POSIX qw(strftime);
 
 my  @PROGARG  = ($0, @ARGV);
-our $VERSION  = '1.19';
+our $VERSION  = '1.20';
 my $tfc_creds =
   { token        => '',
     workspace_id => { qa    => '',
@@ -90,7 +90,6 @@ foreach my $en (sort (keys %ENV)) {
 pod2usage(-message => "\nCredential workspace/s are not set. Look option B<-e> description.\n", -exitval => 2, -verbose => 0)
   if length( join( "", values( %{$tfc_creds->{workspace_id}} ) ) ) < 1;
 
-p $tfc_creds; exit 1;
 
 $o{db}  = 'tfc-variables' if ! $o{db};
 $o{env} = 'qa'            if ! $o{env};
