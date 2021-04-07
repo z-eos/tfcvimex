@@ -22,7 +22,7 @@ use DBI;
 use POSIX qw(strftime);
 
 my  @PROGARG  = ($0, @ARGV);
-our $VERSION  = '1.20';
+our $VERSION  = '1.21';
 my $tfc_creds =
   { token        => '',
     workspace_id => { qa    => '',
@@ -134,16 +134,22 @@ $o{org} = $ENV{'TFCVIMEX_ORG'}
 ###################################################################
 if ( $o{get_org} ) {
   my $org = tfc_getorg($client);
-  p( $org, caller_message => "ORGANIZATIONS AVAILABLE:");
+  p( $org, caller_message => "ORGANIZATIONS AVAILABLE:")
+    if $o{debug} > 0;
+  print "export TFCVIMEX_ORG='$_'\n"
+    foreach (sort(keys(%$org)));
   exit 0;
 }
 
 ###################################################################
-# GET WORSPACES
+# GET WORKSPACES
 ###################################################################
 if ( $o{get_ws} ) {
-  my $org = tfc_getws($client, $o{org});
-  p( $org, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}):");
+  my $ws = tfc_getws($client, $o{org});
+  p( $ws, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}):")
+    if $o{debug} > 0;
+  print "export TFCVIMEX_WORKSPACE_ID_",uc($_),"='$ws->{$_}->{id}'\n"
+    foreach (sort(keys(%$ws)));
   exit 0;
 }
 
@@ -718,11 +724,13 @@ push data into TFC via Workspace Variables API request
 
 =item B<--get-org>
 
-get all available to your token organizations
+get all organizations, available to your token. Output is suitable for
+input to the shell as envs.
 
 =item B<--get-ws>
 
-get all available to your token workspaces
+get all workspaces, available to your token. Output is suitable for
+input to the shell as envs.
 
 =item B<--org>
 
