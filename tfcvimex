@@ -72,10 +72,11 @@ if ( -e -r "$ENV{'HOME'}/.terraform.d/credentials.tfrc.json" ) {
   }
   close($fh) || warn "close failed: $!";
   $tfc_creds->{token} = $json->decode( $tfrc_json )->{credentials}->{'app.terraform.io'}->{token};
-  p $tfc_creds->{token} if $o{debug} > 0;
 } elsif ( exists $ENV{'TFCVIMEX_TOKEN'} && length($ENV{'TFCVIMEX_TOKEN'}) > 0 ) {
   $tfc_creds->{token} = $ENV{'TFCVIMEX_TOKEN'}
 }
+
+p($tfc_creds->{token}, caller_message => "TFC access token used: __FILENAME__:__LINE__ ") if $o{debug} > 0;
 
 pod2usage(-message => "Credential token not set. Look section CREDENTIALS of the manual.", -exitval => 2,
 	  -verbose => 99, -sections => [qw(CREDENTIALS)])
@@ -134,7 +135,7 @@ $o{org} = $ENV{'TFCVIMEX_ORG'}
 ###################################################################
 if ( $o{get_org} ) {
   my $org = tfc_getorg($client);
-  p( $org, caller_message => "ORGANIZATIONS AVAILABLE:")
+  p( $org, caller_message => "ORGANIZATIONS AVAILABLE: __FILENAME__:__LINE__ ")
     if $o{debug} > 0;
   print "export TFCVIMEX_ORG='$_'\n"
     foreach (sort(keys(%$org)));
@@ -146,7 +147,7 @@ if ( $o{get_org} ) {
 ###################################################################
 if ( $o{get_ws} ) {
   my $ws = tfc_getws($client, $o{org});
-  p( $ws, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}):")
+  p( $ws, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}): __FILENAME__:__LINE__ ")
     if $o{debug} > 0;
   print "export TFCVIMEX_WORKSPACE_ID_",uc($_),"='$ws->{$_}->{id}'\n"
     foreach (sort(keys(%$ws)));
