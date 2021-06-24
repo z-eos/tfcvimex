@@ -11,11 +11,11 @@ Script to import/export terraform cloud variables
 
 ### CPAN
 
-> cpan -i Data::Printer
-> cpan -i DBI
-> cpan -i DBD::SQLite
-> cpan -i JSON
-> cpan -i REST::Client
+1. cpan -i Data::Printer
+2. cpan -i DBI
+3. cpan -i DBD::SQLite
+4. cpan -i JSON
+5. cpan -i REST::Client
 
 ### Ubuntu
 
