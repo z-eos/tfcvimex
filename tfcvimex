@@ -22,7 +22,7 @@ use DBI;
 use POSIX qw(strftime);
 
 my  @PROGARG  = ($0, @ARGV);
-our $VERSION  = '1.21';
+our $VERSION  = '1.22';
 my $tfc_creds =
   { token        => '',
     workspace_id => { qa    => '',
@@ -50,6 +50,7 @@ GetOptions (
 	    'get-ws'            => \$o{get_ws},
 	    'j|json-file=s'     => \$o{json_file},
 	    'org=s'             => \$o{org},
+	    'ws-id=s'           => \$o{ws_id},
 	    'p|pull'            => \$o{pull},
 	    'P|push'            => \$o{push},
 	    'i|import'          => \$o{import},
@@ -82,10 +83,15 @@ pod2usage(-message => "Credential token not set. Look section CREDENTIALS of the
 	  -verbose => 99, -sections => [qw(CREDENTIALS)])
   if $tfc_creds->{token} eq '';
 
+# collecting workspaces
 foreach my $en (sort (keys %ENV)) {
   next if $en !~ /TFCVIMEX_WORKSPACE_ID_/;
-  $tfc_creds->{workspace_id}->{lc(substr($en, 22))} = $ENV{$en}
-    if length($ENV{$en}) > 0;
+  if ( $o{ws_id} ) {
+    $tfc_creds->{workspace_id}->{$o{env}} = $o{ws_id};
+  } else {
+    $tfc_creds->{workspace_id}->{lc(substr($en, 22))} = $ENV{$en}
+      if length($ENV{$en}) > 0;
+  }
 }
 
 pod2usage(-message => "\nCredential workspace/s are not set. Look option B<-e> description.\n", -exitval => 2, -verbose => 0)
@@ -128,7 +134,8 @@ $client->addHeader('Content-Type',  'application/vnd.api+json');
 my ($tfvars, $sth, $stmt, $rc, $rv, $hash_ref, @tmp_arr);
 
 $o{org} = $ENV{'TFCVIMEX_ORG'}
-  if exists $ENV{'TFCVIMEX_ORG'} && length($ENV{'TFCVIMEX_ORG'}) > 0;
+  if (! exists $o{org} || ! defined $o{org}) &&
+  exists $ENV{'TFCVIMEX_ORG'} && length($ENV{'TFCVIMEX_ORG'}) > 0;
 
 ###################################################################
 # GET ORGANIZATIONS
@@ -378,7 +385,7 @@ if ( $o{import} ) {
 }
 
 # $source->commit(); ???
-# $sth->finish     || croak $sth->errstr;
+$sth->finish     || croak $sth->errstr;
 $dbh->disconnect || croak $dbh->errstr;
 
 #################################################################
@@ -698,7 +705,7 @@ beginning of script (default is qa).
 
 variables B<TFCVIMEX_WORKSPACE_ID_XXX> value is a TFC workspace id,
 where XXX is the ID set with option B<-e> (in general it is human
-readable alias, like qa/dev/stage/etc )
+readable alias, like qa/dev/stage/etc ) see B<--ws-id> as well
 
 to know workspaces available, look B<--get-ws> option description.
 
@@ -736,6 +743,10 @@ input to the shell as envs.
 =item B<--org>
 
 set organization name (mandatory if option --get-ws requested)
+
+=item B<--ws-id>
+
+set workspace id (overrides the value provided in environmental variable)
 
 =item B<-i | --import>
 
@@ -881,7 +892,7 @@ Zeus Panchenko <zeus@gnu.org.ua>
 
 =head1 COPYRIGHT
 
-Copyright 2020 Zeus Panchenko.
+Copyright 2021 Zeus Panchenko.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
