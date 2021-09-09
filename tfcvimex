@@ -22,8 +22,8 @@ use DBI;
 use POSIX qw(strftime);
 
 my  @PROGARG  = ($0, @ARGV);
-our $VERSION  = '1.22';
-my $tfc_creds =
+our $VERSION  = '1.23';
+our $tfc_creds =
   { token        => '',
     workspace_id => { qa    => '',
 		      dev   => '',
@@ -48,6 +48,7 @@ GetOptions (
 	    'n|dry-run'         => \$o{dry_run},
 	    'get-org'           => \$o{get_org},
 	    'get-ws'            => \$o{get_ws},
+	    'get-vars'          => \$o{get_vars},
 	    'j|json-file=s'     => \$o{json_file},
 	    'org=s'             => \$o{org},
 	    'ws-id=s'           => \$o{ws_id},
@@ -122,8 +123,8 @@ pod2usage(-exitval => 0, -verbose => 1, -msg => "\nERROR: to get workspaces, you
 	 length($ENV{'TFCVIMEX_ORG'}) < 1 ) );
 
 pod2usage(-exitval => 0, -verbose => 2, -msg => "\nERROR: action is not clear (only one option can be set: -p, -P or -j)\n\n")
-  if ($o{json_file} && $o{pull} && $o{push})    ||
-  ($o{json_file} && ($o{pull} || $o{push}))     ||
+  if ($o{json_file} && $o{pull} && $o{push}) ||
+  ($o{json_file} && ($o{pull} || $o{push}))  ||
   ($o{pull} && $o{push});
 
   my $client = REST::Client->new();
@@ -156,7 +157,8 @@ if ( $o{get_ws} ) {
   my $ws = tfc_getws($client, $o{org});
   p( $ws, caller_message => "WORKSPACESS AVAILABLE (org: $o{org}): __FILENAME__:__LINE__ ")
     if $o{debug} > 0;
-  print "export TFCVIMEX_WORKSPACE_ID_",uc($_),"='$ws->{$_}->{id}'\n"
+  print "export TFCVIMEX_ORG='$o{org}'\n";
+  print "export TFCVIMEX_WORKSPACE_ID_",uc($_ =~ s/-/_/r),"='$ws->{$_}->{id}'\n"
     foreach (sort(keys(%$ws)));
   exit 0;
 }
@@ -169,7 +171,7 @@ if ( $o{json_file} || $o{pull} ) {
     if $o{json_file};
   $tfvars = tfc_pull($client, $tfc_creds->{workspace_id}->{$o{env}})
     if $o{pull};
-  $stmt = qq(INSERT OR REPLACE INTO tfc_variables VALUES (?,?,?,?,?,?,?,?,?));
+  $stmt = qq(INSERT OR REPLACE INTO tfc_variables VALUES (?,?,?,?,?,?,?,?,?,?));
 
   $dbh->begin_work if ! $o{dry_run};
   foreach ( @{$tfvars->{data}} ) {
@@ -186,6 +188,7 @@ if ( $o{json_file} || $o{pull} ) {
 		    $_->{attributes}->{category},
 		    $_->{attributes}->{hcl},
 		    $_->{attributes}->{description},
+		    $tfc_creds->{workspace_id}->{$o{env}},
 		    $o{env}
 		   ) || croak $sth->errstr;
     } else {
@@ -234,9 +237,14 @@ if ( $o{push} ) {
 
     $o{tfc}->{$tfvar->{attributes}->{key}} = $tfvar;
 
-    $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ? AND attr_key = ?;);
+    $stmt = qq(SELECT * FROM tfc_variables
+               WHERE workspace_id = ?
+                 AND environment = ?
+                 AND attr_key = ?;);
     $sth = $dbh->prepare( $stmt );
-    $sth->execute($o{env}, $tfvar->{attributes}->{key})
+    $sth->execute($tfc_creds->{workspace_id}->{$o{env}},
+		  $o{env},
+		  $tfvar->{attributes}->{key})
       || croak $dbh->errstr;
     my $row = $sth->fetchrow_hashref;
     if ( $tfvar->{attributes}->{value} && $row->{attr_value} &&
@@ -287,16 +295,21 @@ if ( $o{push} ) {
   }
 
   #-- sync TFC against SQL
-  $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ?;);
+  $stmt = qq(SELECT * FROM tfc_variables
+             WHERE workspace_id = ?
+               AND environment = ?;);
   $sth = $dbh->prepare( $stmt );
-  $sth->execute($o{env}) || croak $dbh->errstr;
+  $sth->execute($tfc_creds->{workspace_id}->{$o{env}}, $o{env}) || croak $dbh->errstr;
   $hash_ref = $sth->fetchall_hashref('attr_key');
   my @tmp = sort keys %{$hash_ref};
   foreach ( @tmp ) {
     if (! exists $o{tfc}->{$_}) {
 
-      $stmt = qq(SELECT * FROM tfc_variables WHERE environment = ? AND attr_key = ?;);
-      $sth = $dbh->prepare( $stmt );
+      $stmt = qq(SELECT * FROM tfc_variables
+                  WHERE workspace_id = ?
+                    AND environment = ?
+                    AND attr_key = ?;);
+      $sth = $dbh->prepare($tfc_creds->{workspace_id}->{$o{env}}, $stmt);
       $sth->execute($o{env}, $_) || croak $dbh->errstr;
       $hash_ref = $sth->fetchrow_hashref;
 
@@ -352,11 +365,12 @@ if ( $o{var} ) {
       print "variable $k has been deleted from db locally\n";
     } else {
       $stmt = qq(INSERT OR REPLACE INTO tfc_variables
-                        VALUES (?,?,?,?,?,?,?,?,?););
+                        VALUES (?,?,?,?,?,?,?,?,?,?););
       $sth = $dbh->prepare($stmt);
       $sth->execute('', 'vars', $k, $v, 0, 'terraform',
 		    is_hcl($v),
 		    sprintf("%s by %s", $o{ts}, $ENV{'USER'}),
+		    $tfc_creds->{workspace_id}->{$o{env}},
 		    $o{env})
 	|| croak $sth->errstr;
       print "\nvariable $k has been insert/replac-ed into db locally\n";
@@ -368,24 +382,59 @@ if ( $o{var} ) {
 # IMPORT INTO TFVARS
 #################################################################
 if ( $o{import} ) {
-  $stmt = qq(SELECT * FROM tfc_variables WHERE environment = "$o{env}" ORDER BY attr_key;);
-  my $rows = $dbh->selectall_arrayref($stmt, { 'Slice' => {} })
-    || croak "$dbh->errstr";
+  $stmt = qq(SELECT * FROM tfc_variables WHERE workspace_id = ? AND environment = ? ORDER BY attr_key;);
+  p $stmt if $o{debug} > 2;
+  p $tfc_creds->{workspace_id}->{$o{env}} if $o{debug} > 2;
+  p $o{env} if $o{debug} > 2;
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute($tfc_creds->{workspace_id}->{$o{env}}, $o{env})
+    || croak $dbh->errstr;
+  my $rows = $sth->fetchall_hashref( 'attr_key' )
+    || croak "$sth->errstr";
 
   my $d;
-  foreach my $row ( @{$rows} ) {
+  foreach (sort (keys %{$rows}) ) {
 
-    printf("### VARIABLE ID: %s\n%s = %s\n\n",
-    	   $row->{id} ne '' ? $row->{id} : 'N/A, not synced to TFC',
-    	   $row->{attr_key},
-	   $row->{attr_hcl} == 1 ? $row->{attr_value} : '"' . $row->{attr_value} . '"'
+    printf("### WORKSPACE ID: %s; VARIABLE ID: %s\n%s = %s\n\n",
+    	   $rows->{$_}->{workspace_id} ne '' ? $rows->{$_}->{workspace_id} : 'N/A, not synced to TFC',
+    	   $rows->{$_}->{id} ne '' ? $rows->{$_}->{id} : 'N/A, not synced to TFC',
+    	   $rows->{$_}->{attr_key},
+	   $rows->{$_}->{attr_hcl} == 1 ? $rows->{$_}->{attr_value} : '"' . $rows->{$_}->{attr_value} . '"'
     	  );
 
   }
 }
 
+#################################################################
+# GET VARS
+#################################################################
+if ( $o{get_vars} ) {
+  $stmt = qq(SELECT id,attr_key FROM tfc_variables
+             WHERE workspace_id = ?
+               AND environment = ?
+             ORDER BY attr_key;);
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute($tfc_creds->{workspace_id}->{$o{env}}, $o{env})
+    || croak $dbh->errstr;
+  my $rows = $sth->fetchall_hashref( 'attr_key' )
+    || croak "$sth->errstr";
+
+  printf("\nWORKSPACE_ID: %s\n\n", $tfc_creds->{workspace_id}->{$o{env}});
+
+  my @s = reverse sort { length($a) <=> length($b) } keys %{$rows};
+  foreach (sort (keys %{$rows}) ) {
+    printf("%*s\t%s\n",
+	   length($s[0]),
+	   $_,
+    	   $rows->{$_}->{id} ne '' ? $rows->{$_}->{id} : 'N/A, not synced to TFC'
+    	  );
+  }
+}
+
 # $source->commit(); ???
-$sth->finish     || croak $sth->errstr;
+if ( defined $sth ) {
+  $sth->finish || croak $sth->errstr;
+}
 $dbh->disconnect || croak $dbh->errstr;
 
 #################################################################
@@ -400,8 +449,11 @@ sub tfc_pull {
 
   if ( $client->responseCode() eq '200' ) {
     return $json->decode( $client->responseContent() );
+  } elsif ( $client->responseCode() eq '404' ) {
+    print "REST ERROR: ", $client->responseContent(), "\nmost probably - environment does not exist ...\n";
+    exit 1;
   } else {
-    croak "REST ERROR: $client->responseContent()";
+    croak "REST ERROR: unknown\n", $client->responseContent(), "\n";
   }
 }
 
@@ -439,7 +491,7 @@ sub tfc_getws {
       }
     return $ws;
   } else {
-    croak "REST ERROR: $client->responseContent()";
+    croak "REST ERROR: ", $client->responseContent(), "\n";
   }
 }
 
@@ -501,11 +553,12 @@ sub db_create {
                      attr_category    TEXT DEFAULT 'terraform',
                      attr_hcl         TEXT,
                      attr_description TEXT,
+                     workspace_id     TEXT NOT NULL,
                      environment      TEXT NOT NULL););
   my $rv = $dbh->do($stmt);
   croak "$DBI::errstr" if $rv < 0;
   $stmt = qq(CREATE UNIQUE INDEX IF NOT EXISTS environment_key
-                    ON tfc_variables (environment, attr_key););
+                    ON tfc_variables (workspace_id, attr_key););
   $rv = $dbh->do($stmt);
   croak "$DBI::errstr" if $rv < 0;
   return 0;
@@ -569,10 +622,14 @@ sub db_cmp {
   $stmt = qq(SELECT a.attr_key, a.attr_value, a.attr_hcl, a.attr_description
              FROM $a AS a LEFT JOIN $b AS b
              ON a.attr_key = b.attr_key AND a.environment = b.environment
-             WHERE b.attr_value IS NULL AND a.environment = ?);
+             WHERE b.attr_value IS NULL
+               AND workspace_id = ?
+               AND a.environment = ?;);
   p $stmt if $debug > 1;
   $sth  = $dbh->prepare( $stmt );
-  my $rv   = $sth->execute( $environment ) || croak $DBI::errstr;
+  my $rv   = $sth->execute( $tfc_creds->{workspace_id}->{$o{env}},
+			    $environment )
+    || croak $DBI::errstr;
   croak "$DBI::errstr" if $rv < 0;
   my $rows = $sth->fetchall_hashref('attr_key');
 
@@ -599,18 +656,20 @@ sub db_cmp_envs {
     p $sth;
   }
 
-  $a{stmt} = sprintf('SELECT attr_key         AS name,
-                             attr_value       AS value,
+  $a{stmt} = sprintf('SELECT attr_key   AS name,
+                             attr_value AS value,
                              (CASE WHEN group_concat(environment) = "%s"
                                    THEN "%s"
                                    ELSE "%s"
                               END) AS env
                       FROM tfc_variables
-                      WHERE environment IN ("%s", "%s")
-                      GROUP BY attr_key%s HAVING count(*) < %s',
+                      WHERE workspace_id = "%s"
+                        AND environment IN ("%s", "%s")
+                      GROUP BY attr_key%s HAVING count(*) < %s;',
 		     $a{env}->[0],
 		     $a{env}->[1],
 		     $a{env}->[0],
+		     $tfc_creds->{workspace_id}->{$o{env}},
 		     $a{env}->[0],
 		     $a{env}->[1],
 		     $a{cmp_env_value} ? ", attr_value" : "",
@@ -699,9 +758,9 @@ backup db file before any other action
 
 =item B<-e | --env>
 
-some ID to map to TFC workspace. B<-e> can be set with environmental
-variables (names are expected in uppercase) or hardcoded in the
-beginning of script (default is qa).
+some ID to map to TFC workspace name. B<-e> can be set with environmental
+variables (names are expected in uppercase) or hardcoded values in the
+beginning of the script (default is qa).
 
 variables B<TFCVIMEX_WORKSPACE_ID_XXX> value is a TFC workspace id,
 where XXX is the ID set with option B<-e> (in general it is human
@@ -739,6 +798,10 @@ input to the shell as envs.
 
 get all workspaces, available to your token. Output is suitable for
 input to the shell as envs.
+
+=item B<--get-vars>
+
+get list of all tuples "variable variable_id"
 
 =item B<--org>
 
@@ -879,6 +942,10 @@ tfcvimex --env stage --cmp-env qa
 B<to see, which environment lacks which variavle/s (with values)>
 
 tfcvimex --env stage --cmp-env qa -D
+
+B<to set environment variables with workspace id>
+
+tfcvimex --org myorg --get-ws > .killme; . .killme; rm .killme
 
 =back
 
